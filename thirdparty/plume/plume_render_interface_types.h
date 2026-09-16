@@ -1782,6 +1782,16 @@ namespace plume {
         RenderDeviceVendor vendor = RenderDeviceVendor::UNKNOWN;
         uint64_t driverVersion = 0;
         uint64_t dedicatedVideoMemory = 0;
+
+        // Vulkan version the device implements (VK_API_VERSION_*), or 0 when the backend has
+        // no such notion. Decides which core structures may be used and which extensions are
+        // optional, so it is worth reporting in logs.
+        uint32_t apiVersion = 0;
+
+        // VkPhysicalDeviceLimits::maxBoundDescriptorSets: how many descriptor sets a pipeline
+        // layout may declare. Four is the Vulkan minimum and what Mali/PowerVR report; the
+        // renderer has to fit inside it there.
+        uint32_t maxBoundDescriptorSets = 0;
     };
 
     struct RenderDeviceCapabilities {

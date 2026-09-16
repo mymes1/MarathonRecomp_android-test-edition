@@ -72,6 +72,11 @@ namespace plume {
     };
 
     static const std::unordered_set<std::string> OptionalInstanceExtensions = {
+        // Carries vkGetPhysicalDeviceProperties2/vkGetPhysicalDeviceFeatures2 on loaders that
+        // only implement Vulkan 1.0 (older Android releases). Enabling it is what the device
+        // setup below assumes, and on 1.1+ loaders the extension is gone or listed as
+        // supported without changing behaviour.
+        VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
 #   if defined(__APPLE__)
         // Tells the system Vulkan loader to enumerate portability drivers, if supported.
         VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
@@ -3908,6 +3913,18 @@ namespace plume {
 
         // Store properties.
         vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
+        description.apiVersion = physicalDeviceProperties.apiVersion;
+        description.maxBoundDescriptorSets = physicalDeviceProperties.limits.maxBoundDescriptorSets;
+
+        fprintf(stderr, "Selected device: %s (Vulkan %u.%u.%u, driver %u.%u.%u), max %u bound descriptor sets.\n",
+            description.name.c_str(),
+            VK_VERSION_MAJOR(physicalDeviceProperties.apiVersion),
+            VK_VERSION_MINOR(physicalDeviceProperties.apiVersion),
+            VK_VERSION_PATCH(physicalDeviceProperties.apiVersion),
+            VK_VERSION_MAJOR(physicalDeviceProperties.driverVersion),
+            VK_VERSION_MINOR(physicalDeviceProperties.driverVersion),
+            VK_VERSION_PATCH(physicalDeviceProperties.driverVersion),
+            description.maxBoundDescriptorSets);
 
         // Check for supported features.
         void *featuresChain = nullptr;
@@ -3991,14 +4008,32 @@ namespace plume {
             vkGetPhysicalDeviceProperties2(physicalDevice, &deviceProperties2);
         }
 
-        // Descriptor-set size limits (Vulkan 1.2 properties) for bindless descriptor sets.
+        // Descriptor-set size limits for bindless descriptor sets. VkPhysicalDeviceVulkan12Properties
+        // may only be chained when the device itself implements Vulkan 1.2; a Vulkan 1.1 driver
+        // (all current Mali drivers on Android 15, for example) does not know the structure and
+        // reporting it zeroes the limits out. Those drivers expose the same numbers through
+        // VkPhysicalDeviceDescriptorIndexingPropertiesEXT instead, which is what makes
+        // descriptor-indexing limits readable on 1.1 hardware.
         VkPhysicalDeviceVulkan12Properties vulkan12Properties = {};
-        vulkan12Properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
+        VkPhysicalDeviceDescriptorIndexingProperties descriptorIndexingProperties = {};
+        const bool deviceSupportsVulkan12 = physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2;
 
-        VkPhysicalDeviceProperties2 deviceProperties2 = {};
-        deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-        deviceProperties2.pNext = &vulkan12Properties;
-        vkGetPhysicalDeviceProperties2(physicalDevice, &deviceProperties2);
+        if (deviceSupportsVulkan12) {
+            vulkan12Properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
+
+            VkPhysicalDeviceProperties2 deviceProperties2 = {};
+            deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            deviceProperties2.pNext = &vulkan12Properties;
+            vkGetPhysicalDeviceProperties2(physicalDevice, &deviceProperties2);
+        }
+        else if (supportedOptionalExtensions.find(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) != supportedOptionalExtensions.end()) {
+            descriptorIndexingProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES_EXT;
+
+            VkPhysicalDeviceProperties2 deviceProperties2 = {};
+            deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            deviceProperties2.pNext = &descriptorIndexingProperties;
+            vkGetPhysicalDeviceProperties2(physicalDevice, &deviceProperties2);
+        }
 
         const bool sampleLocationsFound = supportedOptionalExtensions.find(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME) != supportedOptionalExtensions.end();
         if (sampleLocationsFound) {
@@ -4220,8 +4255,13 @@ namespace plume {
         capabilities.textureCompressionBC = deviceFeatures.features.textureCompressionBC;
         capabilities.textureCompressionETC2 = deviceFeatures.features.textureCompressionETC2;
         if (descriptorIndexingSupported) {
-            capabilities.maxSampledImageDescriptors = std::min(vulkan12Properties.maxDescriptorSetUpdateAfterBindSampledImages, vulkan12Properties.maxPerStageDescriptorUpdateAfterBindSampledImages);
-            capabilities.maxSamplerDescriptors = std::min(vulkan12Properties.maxDescriptorSetUpdateAfterBindSamplers, vulkan12Properties.maxPerStageDescriptorUpdateAfterBindSamplers);
+            const uint32_t maxUpdateAfterBindSampledImages = deviceSupportsVulkan12 ? vulkan12Properties.maxDescriptorSetUpdateAfterBindSampledImages : descriptorIndexingProperties.maxDescriptorSetUpdateAfterBindSampledImages;
+            const uint32_t maxPerStageUpdateAfterBindSampledImages = deviceSupportsVulkan12 ? vulkan12Properties.maxPerStageDescriptorUpdateAfterBindSampledImages : descriptorIndexingProperties.maxPerStageDescriptorUpdateAfterBindSampledImages;
+            const uint32_t maxUpdateAfterBindSamplers = deviceSupportsVulkan12 ? vulkan12Properties.maxDescriptorSetUpdateAfterBindSamplers : descriptorIndexingProperties.maxDescriptorSetUpdateAfterBindSamplers;
+            const uint32_t maxPerStageUpdateAfterBindSamplers = deviceSupportsVulkan12 ? vulkan12Properties.maxPerStageDescriptorUpdateAfterBindSamplers : descriptorIndexingProperties.maxPerStageDescriptorUpdateAfterBindSamplers;
+
+            capabilities.maxSampledImageDescriptors = std::min(maxUpdateAfterBindSampledImages, maxPerStageUpdateAfterBindSampledImages);
+            capabilities.maxSamplerDescriptors = std::min(maxUpdateAfterBindSamplers, maxPerStageUpdateAfterBindSamplers);
         } else {
             capabilities.maxSampledImageDescriptors = std::min(physicalDeviceProperties.limits.maxDescriptorSetSampledImages, physicalDeviceProperties.limits.maxPerStageDescriptorSampledImages);
             capabilities.maxSamplerDescriptors = std::min(physicalDeviceProperties.limits.maxDescriptorSetSamplers, physicalDeviceProperties.limits.maxPerStageDescriptorSamplers);
@@ -4578,12 +4618,39 @@ namespace plume {
             }
         }
 
+        // Ask for at most what the loader can give. VkInstanceCreateInfo is rejected with
+        // VK_ERROR_INCOMPATIBLE_DRIVER when pApplicationInfo->apiVersion is higher than the
+        // loader's version, and mobile devices keep their loaders for the life of the OS
+        // image: Android 9/10 ship a Vulkan 1.0/1.1 loader even though the driver behind it
+        // may be newer. The instance version only has to cover the core structures queried
+        // below; everything device-side is gated on the device's own version.
+        uint32_t loaderApiVersion = VK_API_VERSION_1_0;
+        if (vkEnumerateInstanceVersion != nullptr) {
+            uint32_t reportedApiVersion = VK_API_VERSION_1_0;
+            if (vkEnumerateInstanceVersion(&reportedApiVersion) == VK_SUCCESS && reportedApiVersion != 0) {
+                loaderApiVersion = reportedApiVersion;
+            }
+        }
+
+        // The version to ask for, with the versions to fall back on. Android's loader checks
+        // the request against the driver it found, not just against itself, so a phone whose
+        // driver implements Vulkan 1.1 (current Mali drivers on Android 15, for example)
+        // rejects a 1.2 instance even though the loader reports 1.3: only the requests at or
+        // below the driver's version work, and a driver that needs 1.1 cannot be known until
+        // it is enumerated, which needs an instance. So try them in order and keep the first
+        // that is accepted.
+        std::vector<uint32_t> instanceApiVersions;
+        instanceApiVersions.push_back(std::min(loaderApiVersion, uint32_t(VK_API_VERSION_1_2)));
+        while (instanceApiVersions.back() > VK_API_VERSION_1_0) {
+            instanceApiVersions.push_back(instanceApiVersions.back() >= VK_API_VERSION_1_2 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0);
+        }
+
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "plume";
         appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.pEngineName = "plume";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-        appInfo.apiVersion = VK_API_VERSION_1_2;
+        appInfo.apiVersion = instanceApiVersions.front();
 
         VkInstanceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -4681,7 +4748,18 @@ namespace plume {
         }
 #   endif
         
-        res = vkCreateInstance(&createInfo, nullptr, &instance);
+        for (uint32_t apiVersion : instanceApiVersions) {
+            appInfo.apiVersion = apiVersion;
+
+            res = vkCreateInstance(&createInfo, nullptr, &instance);
+            if (res == VK_SUCCESS) {
+                fprintf(stderr, "Created a Vulkan %u.%u.%u instance.\n", VK_VERSION_MAJOR(apiVersion), VK_VERSION_MINOR(apiVersion), VK_VERSION_PATCH(apiVersion));
+                break;
+            }
+
+            fprintf(stderr, "vkCreateInstance with API version %u.%u.%u failed with error code 0x%X.\n", VK_VERSION_MAJOR(apiVersion), VK_VERSION_MINOR(apiVersion), VK_VERSION_PATCH(apiVersion), res);
+        }
+
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateInstance failed with error code 0x%X.\n", res);
             return;

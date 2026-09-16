@@ -417,7 +417,37 @@ static std::unique_ptr<RenderDescriptorSet> g_samplerDescriptorSet;
 
 static constexpr uint32_t CONDITIONAL_SURVEY_MAX = 64;
 static std::unique_ptr<RenderBuffer> g_conditionalSurveyBuffer;
+
+// Descriptor set layout, in set order: three texture heaps, the sampler heap and the
+// occlusion-survey storage buffer.
+//
+// The survey buffer normally gets a set of its own, which needs five sets in every
+// pipeline layout. Mali drivers (and some other mobile drivers, e.g. PowerVR) report
+// maxBoundDescriptorSets == 4, and VkPipelineLayoutCreateInfo::setLayoutCount is not
+// allowed to exceed it - on those GPUs a five-set layout cannot be created at all, so
+// nothing is drawn. Those builds move the survey buffer into the sampler set instead
+// (binding 1, next to the sampler heap at binding 0), which four sets can express; every
+// Vulkan implementation supports four. MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS is set by
+// CMake for exactly the builds whose shaders were compiled with the same layout (see
+// cmake/generate_shader_common.cmake).
+#if defined(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS)
+// The survey buffer is the first range of the merged set, so it owns descriptor index 0
+// and the samplers start at index 1. The buffer has to come first because plume marks the
+// last range of a set as the boundless (update-after-bind, variable count) one, and that
+// has to stay the sampler heap.
+static constexpr uint32_t SAMPLER_DESCRIPTOR_INDEX_BASE = 1;
+
+// Binding 1 of set 3: s0 (the sampler heap) is binding 0, u1 is the survey buffer.
+static constexpr uint32_t CONDITIONAL_SURVEY_BINDING = 1;
+static constexpr uint32_t MAIN_PIPELINE_LAYOUT_SET_COUNT = 4;
+#else
+// Survey buffer in its own set (set 4, binding 0), samplers at descriptor index 0.
+static constexpr uint32_t SAMPLER_DESCRIPTOR_INDEX_BASE = 0;
+static constexpr uint32_t CONDITIONAL_SURVEY_BINDING = 0;
+static constexpr uint32_t MAIN_PIPELINE_LAYOUT_SET_COUNT = 5;
+
 static std::unique_ptr<RenderDescriptorSet> g_conditionalSurveyDescriptorSet;
+#endif
 
 // Diagnostic override (Android): when a driver_import/disable_conditional_survey.txt
 // marker exists, Sonic 2006's occlusion-survey path is forced off so every draw
@@ -1727,6 +1757,13 @@ static void CreateImGuiBackend()
     pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
 
     descriptorSetBuilder.begin();
+#if defined(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS)
+    // ImGui draws bind the game's sampler set (see DrawImGui), which also carries the
+    // occlusion survey buffer on four-set devices, so this layout has to declare that
+    // binding as well or the bound set is not layout-compatible. The ImGui shaders do not
+    // read it.
+    descriptorSetBuilder.addReadWriteStructuredBuffer(CONDITIONAL_SURVEY_BINDING);
+#endif
     descriptorSetBuilder.addSampler(0, g_samplerDescriptorSize);
     descriptorSetBuilder.end(true, g_samplerDescriptorSize);
     pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
@@ -1928,8 +1965,12 @@ static void BeginCommandList()
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+    // On four-set devices this set also carries the occlusion survey buffer (set 3, binding
+    // 1), so there is no fifth set to bind.
     commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+#if !defined(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS)
     commandList->setGraphicsDescriptorSet(g_conditionalSurveyDescriptorSet.get(), 4);
+#endif
 
     g_readyForCommands = true;
     g_readyForCommands.notify_one();
@@ -2137,6 +2178,43 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     if (g_device == nullptr)
     {
         return false;
+    }
+
+    // One line that says which GPU, driver and Vulkan version the game ended up on, and how
+    // many descriptor sets its pipelines are allowed to declare. Mali devices report four
+    // here, which is why those builds merge the occlusion survey buffer into the sampler set;
+    // a report that says five means the device does not need that, and "Unknown" means the
+    // backend does not expose a Vulkan version at all.
+    {
+        const RenderDeviceDescription &deviceDescription = g_device->getDescription();
+
+        // Vulkan packs versions as 10 bits of major, 10 of minor and 12 of patch. This file
+        // stays free of Vulkan headers (the D3D12 and Metal backends share it), so the split
+        // is done by hand rather than with VK_VERSION_*.
+        auto versionPart = [](uint32_t version, uint32_t shift, uint32_t mask)
+        {
+            return (version >> shift) & mask;
+        };
+
+        if (deviceDescription.apiVersion != 0)
+        {
+            LOGF("GPU: {} (Vulkan {}.{}.{}, driver {}.{}.{}, {} max bound descriptor sets).",
+                deviceDescription.name,
+                versionPart(deviceDescription.apiVersion, 22, 0x7F), versionPart(deviceDescription.apiVersion, 12, 0x3FF), versionPart(deviceDescription.apiVersion, 0, 0xFFF),
+                versionPart(deviceDescription.driverVersion, 22, 0x7F), versionPart(deviceDescription.driverVersion, 12, 0x3FF), versionPart(deviceDescription.driverVersion, 0, 0xFFF),
+                deviceDescription.maxBoundDescriptorSets);
+        }
+        else
+        {
+            LOGF("GPU: {} (no Vulkan version reported by this backend).", deviceDescription.name);
+        }
+
+        if (deviceDescription.maxBoundDescriptorSets != 0 &&
+            deviceDescription.maxBoundDescriptorSets < MAIN_PIPELINE_LAYOUT_SET_COUNT)
+        {
+            LOGF_WARNING("This GPU only allows {} bound descriptor sets but the renderer's layout uses {}; expect resource binding failures.",
+                deviceDescription.maxBoundDescriptorSets, MAIN_PIPELINE_LAYOUT_SET_COUNT);
+        }
     }
 
 #ifdef MARATHON_RECOMP_D3D12
@@ -2471,18 +2549,6 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
     pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
     pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
-    
-    descriptorSetBuilder.begin();
-    descriptorSetBuilder.addSampler(0, g_samplerDescriptorSize);
-    descriptorSetBuilder.end(true, g_samplerDescriptorSize);
-    
-    g_samplerDescriptorSet = descriptorSetBuilder.create(g_device.get());
-    auto& [descriptorIndex, sampler] = g_samplerStates[XXH3_64bits(&g_samplerDescs[0], sizeof(RenderSamplerDesc))];
-    descriptorIndex = 1;
-    sampler = g_device->createSampler(g_samplerDescs[0]);
-    g_samplerDescriptorSet->setSampler(0, sampler.get());
-
-    pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
 
     RenderBufferDesc conditionalSurveyBufferDesc;
     conditionalSurveyBufferDesc.size = CONDITIONAL_SURVEY_MAX * sizeof(uint32_t);
@@ -2490,16 +2556,60 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     conditionalSurveyBufferDesc.flags = RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS;
     g_conditionalSurveyBuffer = g_device->createBuffer(conditionalSurveyBufferDesc);
 
-    RenderDescriptorSetBuilder conditionalSurveyDescriptorSetBuilder;
-    conditionalSurveyDescriptorSetBuilder.begin();
-    conditionalSurveyDescriptorSetBuilder.addReadWriteStructuredBuffer(0);
-    conditionalSurveyDescriptorSetBuilder.end();
-    g_conditionalSurveyDescriptorSet = conditionalSurveyDescriptorSetBuilder.create(g_device.get());
-
     RenderBufferStructuredView conditionalSurveyStructuredView(sizeof(uint32_t));
-    g_conditionalSurveyDescriptorSet->setBuffer(0, g_conditionalSurveyBuffer.get(), 0, &conditionalSurveyStructuredView);
 
-    pipelineLayoutBuilder.addDescriptorSet(conditionalSurveyDescriptorSetBuilder);
+    descriptorSetBuilder.begin();
+#if defined(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS)
+    {
+        // Set 3 = sampler heap (binding 0) + survey buffer (binding 1). The buffer is added
+        // first so the sampler range stays last and keeps the boundless flags plume applies
+        // to the end of a set (update after bind, partially bound, variable descriptor
+        // count), which this heap depends on.
+        descriptorSetBuilder.addReadWriteStructuredBuffer(CONDITIONAL_SURVEY_BINDING);
+        descriptorSetBuilder.addSampler(0, g_samplerDescriptorSize);
+        descriptorSetBuilder.end(true, g_samplerDescriptorSize);
+
+        g_samplerDescriptorSet = descriptorSetBuilder.create(g_device.get());
+        g_samplerDescriptorSet->setBuffer(0, g_conditionalSurveyBuffer.get(), 0, &conditionalSurveyStructuredView);
+    }
+#else
+    {
+        descriptorSetBuilder.addSampler(0, g_samplerDescriptorSize);
+        descriptorSetBuilder.end(true, g_samplerDescriptorSize);
+
+        g_samplerDescriptorSet = descriptorSetBuilder.create(g_device.get());
+    }
+#endif
+
+    auto& [descriptorIndex, sampler] = g_samplerStates[XXH3_64bits(&g_samplerDescs[0], sizeof(RenderSamplerDesc))];
+    descriptorIndex = SAMPLER_DESCRIPTOR_INDEX_BASE + 1;
+    sampler = g_device->createSampler(g_samplerDescs[0]);
+    g_samplerDescriptorSet->setSampler(SAMPLER_DESCRIPTOR_INDEX_BASE, sampler.get());
+
+    pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
+
+#if !defined(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS)
+    {
+        RenderDescriptorSetBuilder conditionalSurveyDescriptorSetBuilder;
+        conditionalSurveyDescriptorSetBuilder.begin();
+        conditionalSurveyDescriptorSetBuilder.addReadWriteStructuredBuffer(CONDITIONAL_SURVEY_BINDING);
+        conditionalSurveyDescriptorSetBuilder.end();
+        g_conditionalSurveyDescriptorSet = conditionalSurveyDescriptorSetBuilder.create(g_device.get());
+        g_conditionalSurveyDescriptorSet->setBuffer(0, g_conditionalSurveyBuffer.get(), 0, &conditionalSurveyStructuredView);
+
+        pipelineLayoutBuilder.addDescriptorSet(conditionalSurveyDescriptorSetBuilder);
+    }
+#endif
+
+    LOGF("Descriptor sets: {} in the main pipeline layout ({} textures per texture set, {} samplers{}).",
+        MAIN_PIPELINE_LAYOUT_SET_COUNT,
+        g_textureDescriptorSize,
+        g_samplerDescriptorSize,
+#if defined(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS)
+        ", occlusion survey buffer merged into the sampler set");
+#else
+        ", occlusion survey buffer in its own set");
+#endif
 
     if (g_backend != Backend::D3D12)
     {
@@ -5359,13 +5469,20 @@ static void ProcSetSamplerState(const RenderCommand& cmd)
         auto& [descriptorIndex, sampler] = g_samplerStates[XXH3_64bits(&samplerDesc, sizeof(RenderSamplerDesc))];
         if (descriptorIndex == NULL)
         {
-            descriptorIndex = g_samplerStates.size();
+            // Stored one above the set-wide descriptor index so that zero can mean "not
+            // created yet". That index is the flat one across the set's ranges, which starts
+            // at SAMPLER_DESCRIPTOR_INDEX_BASE because a leading range may precede the
+            // sampler heap (the occlusion survey buffer owns index 0 on four-set devices).
+            descriptorIndex = g_samplerStates.size() + SAMPLER_DESCRIPTOR_INDEX_BASE;
             sampler = g_device->createSampler(samplerDesc);
 
             g_samplerDescriptorSet->setSampler(descriptorIndex - 1, sampler.get());
         }
 
-        SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.samplerIndices[args.index], descriptorIndex - 1);
+        // The shaders index the heap as g_SamplerDescriptorHeap[i], where the range's first
+        // element is i == 0, so the descriptor index has to be shifted back down by the
+        // range's own base as well.
+        SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.samplerIndices[args.index], descriptorIndex - 1 - SAMPLER_DESCRIPTOR_INDEX_BASE);
     }
 }
 
