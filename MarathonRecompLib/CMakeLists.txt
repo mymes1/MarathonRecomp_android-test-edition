@@ -76,7 +76,10 @@ add_custom_command(
 )
 
 set(XENOS_RECOMP_ROOT "${MARATHON_RECOMP_TOOLS_ROOT}/XenosRecomp/XenosRecomp")
-set(XENOS_RECOMP_INCLUDE "${XENOS_RECOMP_ROOT}/shader_common.h")
+# The generated copy of the submodule's header, not the submodule file itself: it is the
+# one the port's own shaders are compiled against, and on Android it carries the four
+# descriptor set binding layout the driver needs. See the top-level CMakeLists.txt.
+set(XENOS_RECOMP_INCLUDE "${MARATHON_RECOMP_SHADER_COMMON_HEADER}")
 
 if (NOT MARATHON_RECOMP_USE_PREBUILT_HOST_TOOLS)
     target_compile_definitions(XenosRecomp PRIVATE

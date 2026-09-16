@@ -1,4 +1,7 @@
-#include "../../../../tools/XenosRecomp/XenosRecomp/shader_common.h"
+// Resolved through the include directory compile_shader() passes to DXC: the same
+// generated shader_common.h the game's recompiled shaders are built with (the Android
+// build moves one declaration to keep the pipeline layout at four descriptor sets).
+#include "shader_common.h"
 
 #ifdef __spirv__
 

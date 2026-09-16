@@ -103,6 +103,37 @@ if (MARATHON_RECOMP_ANDROID)
     )
 endif()
 
+# The shader binding layout has to be identical in three places: the recompiled game
+# shaders (XenosRecomp inlines shader_common.h into every generated shader), the port's
+# own HLSL shaders, and the packet of descriptor set layouts built in gpu/video.cpp.
+# XenosRecomp takes the header path as an argument (and the in-tree build bakes it in as
+# XENOS_RECOMP_INCLUDE_INPUT), so the build feeds both consumers the same generated copy
+# instead of the submodule path. Android additionally patches one declaration in it; see
+# cmake/generate_shader_common.cmake for why (Mali's maxBoundDescriptorSets is 4).
+if (MARATHON_RECOMP_ANDROID)
+    set(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS ON)
+else()
+    set(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS OFF)
+endif()
+
+set(MARATHON_RECOMP_SHADER_COMMON_SOURCE "${MARATHON_RECOMP_TOOLS_ROOT}/XenosRecomp/XenosRecomp/shader_common.h")
+set(MARATHON_RECOMP_SHADER_COMMON_DIR "${CMAKE_BINARY_DIR}/shader_common")
+set(MARATHON_RECOMP_SHADER_COMMON_HEADER "${MARATHON_RECOMP_SHADER_COMMON_DIR}/shader_common.h")
+
+add_custom_command(
+    OUTPUT "${MARATHON_RECOMP_SHADER_COMMON_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DSRC=${MARATHON_RECOMP_SHADER_COMMON_SOURCE}
+        -DOUT=${MARATHON_RECOMP_SHADER_COMMON_HEADER}
+        -DFOUR_DESCRIPTOR_SETS=${MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS}
+        -P "${CMAKE_SOURCE_DIR}/cmake/generate_shader_common.cmake"
+    DEPENDS
+        "${MARATHON_RECOMP_SHADER_COMMON_SOURCE}"
+        "${CMAKE_SOURCE_DIR}/cmake/generate_shader_common.cmake"
+    COMMENT "Generating the shader_common.h the shader build and the shader recompiler use"
+    VERBATIM
+)
+
 if (MARATHON_RECOMP_HOST_TOOLS_ONLY)
     add_subdirectory(${MARATHON_RECOMP_TOOLS_ROOT})
 else()

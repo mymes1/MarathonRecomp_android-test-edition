@@ -426,6 +426,13 @@ if (MARATHON_RECOMP_FLATPAK)
     )
 endif()
 
+if (MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS)
+    # The renderer keeps its pipeline layouts within four descriptor sets on builds whose
+    # shaders were compiled for that layout (see the top-level CMakeLists.txt). Both sides
+    # must agree, so this comes from the same variable that patches shader_common.h.
+    target_compile_definitions(MarathonRecomp PRIVATE MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS)
+endif()
+
 if (ANDROID)
     # Game files are installed from the app's own launcher (SAF file picker) into the
     # app's private storage. This avoids /sdcard's FUSE-based scoped storage layer, which
@@ -615,18 +622,21 @@ function(compile_shader FILE_PATH TARGET_NAME)
         )
         BIN2C(TARGET_OBJ MarathonRecomp SOURCE_FILE "${MSL_FILE_PATH}.metallib" DEST_FILE "${MSL_FILE_PATH}.metallib" ARRAY_NAME "g_${MSL_NAME}_air")
     endif()
+    # The shaders include shader_common.h, which has to come from the generated copy the
+    # game's own recompiled shaders get (see the top-level CMakeLists.txt): the include
+    # directory is what keeps the port's descriptor set layouts in step with them.
     if (MARATHON_RECOMP_D3D12)
         add_custom_command(
             OUTPUT ${HLSL_FILE_PATH}.dxil.h
-            COMMAND ${DIRECTX_DXC_TOOL} -T ${TARGET_NAME} -HV 2021 -all-resources-bound -Wno-ignored-attributes -DMARATHON_RECOMP -E shaderMain -Fh ${HLSL_FILE_PATH}.dxil.h ${HLSL_FILE_PATH} -Vn g_${HLSL_NAME}_dxil
-            DEPENDS ${HLSL_FILE_PATH}
+            COMMAND ${DIRECTX_DXC_TOOL} -T ${TARGET_NAME} -HV 2021 -all-resources-bound -Wno-ignored-attributes -I ${MARATHON_RECOMP_SHADER_COMMON_DIR} -DMARATHON_RECOMP -E shaderMain -Fh ${HLSL_FILE_PATH}.dxil.h ${HLSL_FILE_PATH} -Vn g_${HLSL_NAME}_dxil
+            DEPENDS ${HLSL_FILE_PATH} ${MARATHON_RECOMP_SHADER_COMMON_HEADER}
         )
         target_sources(MarathonRecomp PRIVATE ${HLSL_FILE_PATH}.dxil.h)
     endif()
     add_custom_command(
         OUTPUT ${HLSL_FILE_PATH}.spirv.h
-        COMMAND ${DIRECTX_DXC_TOOL} -T ${TARGET_NAME} -HV 2021 -all-resources-bound -spirv -fvk-use-dx-layout ${ARGN} -DMARATHON_RECOMP -E shaderMain -Fh ${HLSL_FILE_PATH}.spirv.h ${HLSL_FILE_PATH} -Vn g_${HLSL_NAME}_spirv
-        DEPENDS ${HLSL_FILE_PATH}
+        COMMAND ${DIRECTX_DXC_TOOL} -T ${TARGET_NAME} -HV 2021 -all-resources-bound -spirv -fvk-use-dx-layout -I ${MARATHON_RECOMP_SHADER_COMMON_DIR} ${ARGN} -DMARATHON_RECOMP -E shaderMain -Fh ${HLSL_FILE_PATH}.spirv.h ${HLSL_FILE_PATH} -Vn g_${HLSL_NAME}_spirv
+        DEPENDS ${HLSL_FILE_PATH} ${MARATHON_RECOMP_SHADER_COMMON_HEADER}
     )
     target_sources(MarathonRecomp PRIVATE ${HLSL_FILE_PATH}.spirv.h)
 endfunction()
