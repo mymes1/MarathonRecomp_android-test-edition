@@ -11,9 +11,11 @@
 # binding brings the pipeline layout back to four sets, which every Vulkan device
 # supports (the Vulkan minimum for maxBoundDescriptorSets is also four).
 #
-# D3D12 cannot host the buffer in the sampler "set" (samplers and UAVs live in
-# different descriptor heaps there), so this is Android-only: every other platform
-# gets a byte-for-byte copy and keeps the original five-set layout.
+# D3D12 can represent this too (plume splits each set into a view table and a
+# sampler table there, and the set index doubles as the register space), but only
+# Android needs it: desktop drivers allow five sets, and leaving their layout
+# alone keeps that path identical to what it was. So this is Android-only: every
+# other platform gets a byte-for-byte copy and keeps the original five-set layout.
 #
 # Invoked as:
 #   cmake -DSRC=<submodule header> -DOUT=<generated header> -DFOUR_DESCRIPTOR_SETS=<ON|OFF>

@@ -104,17 +104,28 @@ if (MARATHON_RECOMP_ANDROID)
 endif()
 
 # The shader binding layout has to be identical in three places: the recompiled game
-# shaders (XenosRecomp inlines shader_common.h into every generated shader), the port's
+# shaders (XenosRecomp inlines shader_common.h into every shader it generates), the port's
 # own HLSL shaders, and the packet of descriptor set layouts built in gpu/video.cpp.
-# XenosRecomp takes the header path as an argument (and the in-tree build bakes it in as
-# XENOS_RECOMP_INCLUDE_INPUT), so the build feeds both consumers the same generated copy
-# instead of the submodule path. Android additionally patches one declaration in it; see
-# cmake/generate_shader_common.cmake for why (Mali's maxBoundDescriptorSets is 4).
-if (MARATHON_RECOMP_ANDROID)
-    set(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS ON)
+# XenosRecomp takes the header path as an argument, so the build feeds both consumers the
+# same generated copy instead of the submodule path. Android additionally patches one
+# declaration in it; see cmake/generate_shader_common.cmake for why (Mali's
+# maxBoundDescriptorSets is 4).
+#
+# Android defaults to the four-set layout because Mali and other mobile drivers cap
+# maxBoundDescriptorSets at 4. A host-tools pass defaults the same way because the tools it
+# produces are consumed by such a build: a prebuilt XenosRecomp reads the header baked into it
+# at its own configure time, so tools built for five sets are of no use to an Android build.
+# Both defaults are only defaults - the value can be passed explicitly, and the check below
+# refuses to combine a build with host tools that were configured for the other layout.
+if (MARATHON_RECOMP_ANDROID OR MARATHON_RECOMP_HOST_TOOLS_ONLY)
+    set(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS_DEFAULT ON)
 else()
-    set(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS OFF)
+    set(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS_DEFAULT OFF)
 endif()
+
+option(MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS
+    "Compile shaders and build pipeline layouts for four descriptor sets (required on Mali)"
+    ${MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS_DEFAULT})
 
 set(MARATHON_RECOMP_SHADER_COMMON_SOURCE "${MARATHON_RECOMP_TOOLS_ROOT}/XenosRecomp/XenosRecomp/shader_common.h")
 set(MARATHON_RECOMP_SHADER_COMMON_DIR "${CMAKE_BINARY_DIR}/shader_common")
@@ -134,8 +145,92 @@ add_custom_command(
     VERBATIM
 )
 
+# Both consumers of the generated header (the shader compile rules in MarathonRecomp and the
+# XenosRecomp invocation in MarathonRecompLib) live in subdirectories, and a custom command
+# output that only subdirectories depend on is not given a build rule at all: ninja then fails
+# with "shader_common/shader_common.h, needed by ..., missing and no known rule to make it".
+# Depending on the output here as well is what makes CMake emit the rule; it does not change
+# the dependency edges of the consumers, which stay on the file and so still rebuild the
+# shaders whenever the header changes.
+add_custom_target(MarathonRecompShaderCommonHeader DEPENDS "${MARATHON_RECOMP_SHADER_COMMON_HEADER}")
+
+# A prebuilt XenosRecomp reads shader_common.h from the path baked into it at ITS configure time
+# (main.cpp prefers XENOS_RECOMP_INCLUDE_INPUT over argv[3]) and silently ignores the path this
+# build passes on the command line. Host tools configured for the other layout would therefore
+# recompile the game's shaders against a descriptor set layout the renderer does not build, which
+# shows up as mis-bound resources on the device rather than as a build error. The baked path is a
+# string in the binary, so check the file it actually points at instead of trusting the caller.
+if (MARATHON_RECOMP_USE_PREBUILT_HOST_TOOLS AND EXISTS "${MARATHON_RECOMP_HOST_XENOS_RECOMP}")
+    file(STRINGS "${MARATHON_RECOMP_HOST_XENOS_RECOMP}" MARATHON_RECOMP_BAKED_SHADER_COMMON_PATHS REGEX "shader_common\\.h")
+
+    # No baked path at all means the tool falls back to the include argument this build passes,
+    # which is always the generated header this build expects.
+    if (MARATHON_RECOMP_BAKED_SHADER_COMMON_PATHS)
+        set(MARATHON_RECOMP_BAKED_SHADER_COMMON_FOUND FALSE)
+        set(MARATHON_RECOMP_BAKED_SHADER_COMMON_PATCHED FALSE)
+        foreach (bakedPath IN LISTS MARATHON_RECOMP_BAKED_SHADER_COMMON_PATHS)
+            if (EXISTS "${bakedPath}")
+                file(READ "${bakedPath}" bakedContents)
+                # Keep in step with the declaration cmake/generate_shader_common.cmake rewrites.
+                if (bakedContents MATCHES "g_ConditionalSurveyBuffer[^;]*register\\(u1, space3\\)")
+                    set(MARATHON_RECOMP_BAKED_SHADER_COMMON_PATCHED TRUE)
+                else()
+                    set(MARATHON_RECOMP_BAKED_SHADER_COMMON_PATCHED FALSE)
+                endif()
+                set(MARATHON_RECOMP_BAKED_SHADER_COMMON_FOUND TRUE)
+                # foreach() clears its loop variable when the loop ends, so keep the path.
+                set(bakedShaderCommonPath "${bakedPath}")
+                break()
+            endif()
+        endforeach()
+
+        if (NOT MARATHON_RECOMP_BAKED_SHADER_COMMON_FOUND)
+            message(FATAL_ERROR
+                "The prebuilt XenosRecomp at '${MARATHON_RECOMP_HOST_XENOS_RECOMP}' reads its "
+                "shader_common.h from a path that does not exist (looked for: "
+                "${MARATHON_RECOMP_BAKED_SHADER_COMMON_PATHS}), so it would fail the moment it runs. "
+                "Build the host tools in this checkout first (build_host_tools.sh, or the host tools "
+                "step of the Android workflow): that both builds the tool and generates the header it "
+                "reads. A tool built in a different checkout or moved here cannot find its header.")
+        else()
+            if (MARATHON_RECOMP_FOUR_DESCRIPTOR_SETS)
+                set(bakedLayoutExpected "four")
+                set(hostToolsHint "-DMARATHON_RECOMP_FOUR_DESCRIPTOR_SETS=ON")
+            else()
+                set(bakedLayoutExpected "five")
+                set(hostToolsHint "-DMARATHON_RECOMP_FOUR_DESCRIPTOR_SETS=OFF")
+            endif()
+
+            if (MARATHON_RECOMP_BAKED_SHADER_COMMON_PATCHED)
+                set(bakedLayoutActual "four")
+            else()
+                set(bakedLayoutActual "five")
+            endif()
+
+            if (NOT bakedLayoutActual STREQUAL bakedLayoutExpected)
+                message(FATAL_ERROR
+                    "The prebuilt XenosRecomp at '${MARATHON_RECOMP_HOST_XENOS_RECOMP}' reads "
+                    "'${bakedShaderCommonPath}', a shader_common.h that lays the occlusion survey buffer out for "
+                    "${bakedLayoutActual} descriptor sets, while this build lays out ${bakedLayoutExpected}. "
+                    "They have to agree, or the game's recompiled shaders bind their resources to sets the "
+                    "renderer does not use. Rebuild the host tools with ${hostToolsHint} (the "
+                    "MARATHON_RECOMP_HOST_TOOLS_ONLY pass), then configure this build again.")
+            endif()
+        endif()
+    endif()
+endif()
+
 if (MARATHON_RECOMP_HOST_TOOLS_ONLY)
     add_subdirectory(${MARATHON_RECOMP_TOOLS_ROOT})
+
+    # A host-tools pass exists to produce the tools for a game build elsewhere, and a prebuilt
+    # XenosRecomp reads its shader_common.h from the path baked in here, so the file has to exist
+    # in this build tree as well. Nothing else in this configure compiles a shader, so give the
+    # generation rule an edge from the tool that depends on it (the CI builds these targets
+    # explicitly rather than "all", so the default target is not enough).
+    if (TARGET XenosRecomp)
+        add_dependencies(XenosRecomp MarathonRecompShaderCommonHeader)
+    endif()
 else()
     add_subdirectory(${MARATHON_RECOMP_THIRDPARTY_ROOT})
 

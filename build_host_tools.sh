@@ -12,7 +12,12 @@ if [ -z "${VCPKG_ROOT:-}" ]; then
     export VCPKG_ROOT="$repo/thirdparty/vcpkg"
 fi
 
-cmake --preset "$preset"
+# The four-descriptor-set layout is baked into these tools (XenosRecomp reads the
+# shader_common.h path it was configured with and ignores the one passed at runtime), so they
+# have to be built the same way the Android build lays its pipeline layouts out. Mali caps
+# maxBoundDescriptorSets at 4; build_android.sh's build fails the configure with an explanatory
+# message if the tools and the build disagree.
+cmake --preset "$preset" -DMARATHON_RECOMP_FOUR_DESCRIPTOR_SETS=ON
 cmake --build "out/build/$preset" --target XenonRecomp XenosRecomp file_to_c u8extract
 
 echo
