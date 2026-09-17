@@ -27,7 +27,7 @@ This is an unofficial Android port of [Marathon Recompiled](https://github.com/s
 
 The reference port targets Adreno 710, 725, 732 and 750 GPUs with bundled Turnip builds. **No driver binaries are committed to this repository** — drop community Turnip builds into `android-apk/app/src/main/assets/bundled_driver/` (names in `MarathonRecomp/os/android/vulkan_driver_android.cpp`) before building the APK. Without them the launcher falls back to the system Vulkan driver, and drivers can still be imported at runtime.
 
-**Mali support is experimental**: recent Mali GPUs (Valhall generation and newer with a Vulkan 1.3 driver) run the game through the stock system driver; the app detects a non-Adreno GPU and skips the bundled Adreno driver automatically.
+**Mali support is experimental**: recent Mali GPUs (Valhall generation and newer) run the game through the stock system driver; the app detects a non-Adreno GPU and skips the bundled Adreno driver automatically. Only Vulkan 1.1 is required — most Mali tablets ship a 1.1 driver on Android 15 (a Galaxy Tab A9's Mali-G57 reports 1.1.177), which works because the extensions the renderer needs, descriptor indexing in particular, are separate from the core version. The renderer also fits its pipeline layouts into four descriptor sets on Android, since Mali caps `maxBoundDescriptorSets` at the Vulkan minimum of four. Verified on a Galaxy Tab A9 Wi-Fi (SM-X110); expect low-end performance from 4 GB devices, not a driver problem.
 
 ## Before you install
 
