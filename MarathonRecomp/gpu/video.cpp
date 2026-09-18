@@ -2471,7 +2471,7 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     // requested image count to the surface limits, and present-wait support decides whether the
     // frame limiter can pace against the compositor at all. Both change behaviour on jank.
     LOGF("Presentation: {} swap chain image(s) requested of the device, present wait {}, vsync {}, max frame latency {}.",
-        bufferCount, g_capabilities.presentWait, Config::VSync, Config::MaxFrameLatency);
+        bufferCount, g_capabilities.presentWait, Config::VSync.Value, Config::MaxFrameLatency.Value);
 
 #if defined(__ANDROID__)
     // A custom loader reaching dlopen/device creation is not sufficient: only a usable WSI
