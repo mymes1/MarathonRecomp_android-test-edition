@@ -202,7 +202,11 @@ def main():
         parser.error("nothing to resolve: pass --log and/or --offsets")
 
     sized, unsized = parse_elf64_symbols(library)
-    print("%s: %d sized + %d unsized function symbols" % (library, len(sized), len(unsized)))
+    span = ""
+    if sized:
+        span = " covering 0x%x-0x%x" % (sized[0].value, sized[-1].value + sized[-1].size)
+    print("%s: %d sized + %d unsized function symbols%s" % (library, len(sized), len(unsized), span))
+    print("(highest offset this library can name: 0x%x)" % (sized[-1].value + sized[-1].size if sized else 0))
     if not sized and not unsized:
         print("")
         print("This library has no .symtab, so offsets cannot be resolved from it.")
@@ -227,13 +231,17 @@ def main():
 
     demangled = demangle(resolved_names)
 
+    highest = sized[-1].value + sized[-1].size if sized else 0
+
     def readable(name):
         base, separator, suffix = name.partition("+")
         return (demangled.get(base, base) + separator + suffix) if separator else demangled.get(base, base)
 
     print("")
     for module, offset, name in report:
-        if name is None and module == module_name:
+        if name is None and module == module_name and offset > highest:
+            print("  %s+0x%x -> (beyond this library's symbols - is the log from a different build?)" % (module, offset))
+        elif name is None and module == module_name:
             print("  %s+0x%x -> (no symbol at or below this offset)" % (module, offset))
         elif name is None:
             print("  %s+0x%x -> (module not supplied; pass --so/--apk for it)" % (module, offset))
