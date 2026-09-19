@@ -4,6 +4,7 @@
 
 #include <android/log.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -11,10 +12,17 @@
 #include <ctime>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <elf.h>
+#include <fcntl.h>
 #include <filesystem>
+#include <link.h>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
+#include <vector>
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
 #include <ucontext.h>
@@ -335,6 +343,223 @@ static void CrashWriteDec(int fd, uint64_t value)
     CrashWriteRaw(fd, p);
 }
 
+// ---------------------------------------------------------------------------
+// Crash symbolization
+// ---------------------------------------------------------------------------
+// A crash report that only says "libmain.so+0x34661a8" is useless to anyone who does
+// not have the exact .so and a symbolizer, which is the case for the people who send
+// these logs in. The .so keeps its symbol table (the APK is a debug build and the libs
+// are extracted, see useLegacyPackaging in android-apk/app/build.gradle), so read that
+// table once at startup and resolve addresses to names while crashing. Nothing here
+// allocates or opens files from the handler: the symbol addresses live in memory and the
+// strings are read from the already-open library file with pread, which is signal-safe.
+// If the table is absent (a stripped build), reports stay module+offset as before.
+
+struct CrashSymbolEntry
+{
+    uint64_t address;
+    uint32_t nameOffset;
+    uint32_t size;
+};
+
+static CrashSymbolEntry* s_crashSymbols = nullptr;
+static size_t s_crashSymbolCount = 0;
+static uintptr_t s_crashSymbolBase = 0;
+static uintptr_t s_crashSymbolEnd = 0;
+static int s_crashSymbolFd = -1;
+static uint64_t s_crashStringTableOffset = 0;
+static uint64_t s_crashStringTableSize = 0;
+
+static int CrashFindPhdrCallback(dl_phdr_info* info, size_t, void* data)
+{
+    const char* wanted = static_cast<const char*>(data);
+    if (info->dlpi_name == nullptr || wanted == nullptr || strcmp(info->dlpi_name, wanted) != 0)
+        return 0;
+
+    for (int i = 0; i < info->dlpi_phnum; i++)
+    {
+        if (info->dlpi_phdr[i].p_type == PT_LOAD)
+            s_crashSymbolEnd = std::max(s_crashSymbolEnd, uintptr_t(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz));
+    }
+
+    return 1;
+}
+
+// Reads the symbol table of the module this code is in. Called from logger::Init().
+static void LoadCrashSymbols()
+{
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&LoadCrashSymbols), &info) == 0 || info.dli_fname == nullptr)
+        return;
+
+    const int fd = open(info.dli_fname, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+
+    Elf64_Ehdr header{};
+    if (pread(fd, &header, sizeof(header), 0) != ssize_t(sizeof(header)) ||
+        memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 || header.e_ident[EI_CLASS] != ELFCLASS64 ||
+        header.e_shoff == 0 || header.e_shnum == 0 || header.e_shnum > 4096 ||
+        header.e_shentsize != sizeof(Elf64_Shdr))
+    {
+        close(fd);
+        return;
+    }
+
+    std::vector<Elf64_Shdr> sections(header.e_shnum);
+    if (pread(fd, sections.data(), sections.size() * sizeof(Elf64_Shdr), header.e_shoff) != ssize_t(sections.size() * sizeof(Elf64_Shdr)))
+    {
+        close(fd);
+        return;
+    }
+
+    const Elf64_Shdr* symbolTable = nullptr;
+    const Elf64_Shdr* stringTable = nullptr;
+    for (const Elf64_Shdr& section : sections)
+    {
+        if (section.sh_type != SHT_SYMTAB)
+            continue;
+
+        symbolTable = &section;
+        if (section.sh_link < sections.size())
+            stringTable = &sections[section.sh_link];
+        break;
+    }
+
+    if (symbolTable == nullptr || stringTable == nullptr ||
+        symbolTable->sh_entsize != sizeof(Elf64_Sym) || symbolTable->sh_size == 0)
+    {
+        close(fd);
+        return;
+    }
+
+    const size_t count = symbolTable->sh_size / sizeof(Elf64_Sym);
+    if (count > (1u << 20))
+    {
+        close(fd);
+        return;
+    }
+
+    std::vector<Elf64_Sym> symbols(count);
+    if (pread(fd, symbols.data(), symbolTable->sh_size, symbolTable->sh_offset) != ssize_t(symbolTable->sh_size))
+    {
+        close(fd);
+        return;
+    }
+
+    std::unique_ptr<CrashSymbolEntry[]> entries(new (std::nothrow) CrashSymbolEntry[count]);
+    if (entries == nullptr)
+    {
+        close(fd);
+        return;
+    }
+
+    size_t kept = 0;
+    for (const Elf64_Sym& symbol : symbols)
+    {
+        // Only function symbols with a name: those are what a backtrace points at.
+        if (ELF64_ST_TYPE(symbol.st_info) != STT_FUNC || symbol.st_value == 0 || symbol.st_name == 0)
+            continue;
+
+        entries[kept].address = symbol.st_value;
+        entries[kept].nameOffset = uint32_t(symbol.st_name);
+        entries[kept].size = uint32_t(std::min<uint64_t>(symbol.st_size, 0xFFFFFFFF));
+        kept++;
+    }
+
+    if (kept == 0)
+    {
+        close(fd);
+        return;
+    }
+
+    std::sort(entries.get(), entries.get() + kept, [](const CrashSymbolEntry& a, const CrashSymbolEntry& b) { return a.address < b.address; });
+
+    s_crashSymbolBase = reinterpret_cast<uintptr_t>(info.dli_fbase);
+    s_crashSymbolEnd = s_crashSymbolBase;
+    dl_iterate_phdr(CrashFindPhdrCallback, const_cast<char*>(info.dli_fname));
+    s_crashStringTableOffset = stringTable->sh_offset;
+    s_crashStringTableSize = stringTable->sh_size;
+    s_crashSymbolFd = fd;
+    s_crashSymbols = entries.release();
+    s_crashSymbolCount = kept;
+
+    char line[160];
+    const int length = snprintf(line, sizeof(line), "crash symbolizer: %zu function symbols from %s", kept, info.dli_fname);
+    if (length > 0)
+        WriteLogRecord("[crash]", nullptr, line, size_t(std::min<int>(length, int(sizeof(line)))));
+}
+
+// Resolves an address against the symbol table, if it landed in the module the table came
+// from. Prints nothing when the table is missing or the address is elsewhere.
+static void CrashWriteSymbol(int fd, uintptr_t address)
+{
+    if (s_crashSymbolCount == 0 || address < s_crashSymbolBase || address >= s_crashSymbolEnd)
+        return;
+
+    const uint64_t relative = uint64_t(address - s_crashSymbolBase);
+
+    size_t low = 0;
+    size_t high = s_crashSymbolCount;
+    while (low < high)
+    {
+        const size_t middle = (low + high) / 2;
+        if (s_crashSymbols[middle].address <= relative)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+
+    if (low == 0)
+        return;
+
+    // A symbol only names an address when the address falls inside it: the nearest symbol
+    // below can easily be a different function with a gap in between. Walk down a bounded
+    // number of entries looking for the function that contains the address, and only fall
+    // back to the nearest-below guess when nothing does.
+    size_t index = 0;
+    for (size_t i = low; i > 0 && low - i < 64; i--)
+    {
+        const CrashSymbolEntry& candidate = s_crashSymbols[i - 1];
+        if (candidate.size != 0 && relative - candidate.address < candidate.size)
+        {
+            index = i;
+            break;
+        }
+    }
+
+    const bool approximate = index == 0;
+    if (approximate)
+        index = low;
+
+    const CrashSymbolEntry& entry = s_crashSymbols[index - 1];
+    const uint64_t nameOffset = s_crashStringTableOffset + entry.nameOffset;
+    if (nameOffset >= s_crashStringTableOffset + s_crashStringTableSize)
+        return;
+
+    char name[256];
+    const uint64_t available = s_crashStringTableOffset + s_crashStringTableSize - nameOffset;
+    const size_t wanted = size_t(std::min<uint64_t>(available, sizeof(name) - 1));
+    const ssize_t got = pread(s_crashSymbolFd, name, wanted, off_t(nameOffset));
+    if (got <= 0)
+        return;
+
+    name[got] = '\0';
+
+    CrashWriteRaw(fd, " -> ");
+    CrashWriteRaw(fd, name);
+
+    const uint64_t offset = relative - entry.address;
+    if (offset != 0)
+    {
+        CrashWriteRaw(fd, "+");
+        CrashWriteHex(fd, offset);
+    }
+
+    if (approximate)
+        CrashWriteRaw(fd, " (approx)");
+}
+
 // dladdr is not formally async-signal-safe, but bionic's implementation only walks
 // already-loaded soinfo structures without allocating; debuggerd relies on the same.
 static void CrashWriteAddress(int fd, const char* label, uint64_t address)
@@ -352,6 +577,8 @@ static void CrashWriteAddress(int fd, const char* label, uint64_t address)
         CrashWriteHex(fd, address - reinterpret_cast<uint64_t>(info.dli_fbase));
         CrashWriteRaw(fd, ")");
     }
+
+    CrashWriteSymbol(fd, uintptr_t(address));
 }
 
 struct CrashUnwindState
@@ -372,6 +599,168 @@ static _Unwind_Reason_Code CrashUnwindCallback(_Unwind_Context* context, void* a
     CrashWriteAddress(state->fd, " ", address);
     CrashWriteRaw(state->fd, "\n");
     return _URC_NO_REASON;
+}
+
+// ---------------------------------------------------------------------------
+// Best-effort backtrace of the thread that faulted
+// ---------------------------------------------------------------------------
+// _Unwind_Backtrace() below unwinds the *handler's* stack, which the signal trampoline
+// ends after one or two frames: useful for the report's own frames, useless for finding
+// the caller. On AArch64 the frame records ([fp] = caller's fp, [fp + 8] = return
+// address) can be walked from the signal context instead, which is what this does. The
+// unwinder is the last thing that should fault, so reads are probed.
+
+static sigjmp_buf s_crashReadJmp;
+static volatile sig_atomic_t s_crashReadArmed = 0;
+
+static void CrashReadFaultHandler(int, siginfo_t*, void*)
+{
+    if (s_crashReadArmed)
+        siglongjmp(s_crashReadJmp, 1);
+}
+
+static bool CrashTryReadWord(uintptr_t address, uint64_t* value)
+{
+    if ((address & 7) != 0)
+        return false;
+
+    struct sigaction probe{};
+    probe.sa_sigaction = CrashReadFaultHandler;
+    probe.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&probe.sa_mask);
+
+    struct sigaction previousSegv{}, previousBus{};
+    sigaction(SIGSEGV, &probe, &previousSegv);
+    sigaction(SIGBUS, &probe, &previousBus);
+
+    bool ok = false;
+    s_crashReadArmed = 1;
+    if (sigsetjmp(s_crashReadJmp, 1) == 0)
+    {
+        *value = *reinterpret_cast<volatile const uint64_t*>(address);
+        ok = true;
+    }
+    s_crashReadArmed = 0;
+
+    sigaction(SIGSEGV, &previousSegv, nullptr);
+    sigaction(SIGBUS, &previousBus, nullptr);
+
+    return ok;
+}
+
+static void CrashWriteFrameChain(int fd, const ucontext_t* context)
+{
+#if defined(__aarch64__)
+    // pc is null here: the faulting instruction was a call through a null pointer, so the
+    // return address in lr is the innermost frame that can be named.
+    CrashWriteRaw(fd, "[crash] frames (return addresses):\n");
+
+    uint32_t frame = 0;
+    const uint64_t linkRegister = context->uc_mcontext.regs[30];
+    if (linkRegister != 0)
+    {
+        CrashWriteRaw(fd, "[crash] #");
+        CrashWriteDec(fd, frame++);
+        CrashWriteAddress(fd, " ", linkRegister);
+        CrashWriteRaw(fd, "\n");
+    }
+
+    uint64_t framePointer = context->uc_mcontext.regs[29];
+    const uint64_t stackPointer = context->uc_mcontext.sp;
+
+    for (int i = 0; i < 48 && frame < 48; i++)
+    {
+        if (framePointer == 0 || (framePointer & 7) != 0 || framePointer < stackPointer)
+            break;
+
+        uint64_t callerFrame = 0;
+        uint64_t returnAddress = 0;
+        if (!CrashTryReadWord(uintptr_t(framePointer), &callerFrame) ||
+            !CrashTryReadWord(uintptr_t(framePointer + 8), &returnAddress))
+        {
+            break;
+        }
+
+        if (returnAddress == 0)
+            break;
+
+        if (returnAddress != linkRegister || frame > 1)
+        {
+            CrashWriteRaw(fd, "[crash] #");
+            CrashWriteDec(fd, frame++);
+            CrashWriteAddress(fd, " ", returnAddress);
+            CrashWriteRaw(fd, "\n");
+        }
+
+        // The stack grows down, so a frame record that does not move up is the end of
+        // the chain (or a stale record): stop rather than loop.
+        if (callerFrame <= framePointer)
+            break;
+
+        framePointer = callerFrame;
+    }
+#else
+    (void)context;
+#endif
+}
+
+static void CrashWriteRegisters(int fd, const ucontext_t* context)
+{
+#if defined(__aarch64__)
+    CrashWriteRaw(fd, "[crash] registers:\n");
+
+    for (int i = 0; i < 30; i += 6)
+    {
+        CrashWriteRaw(fd, "[crash]  ");
+        for (int j = i; j < i + 6 && j < 30; j++)
+        {
+            CrashWriteRaw(fd, " x");
+            CrashWriteDec(fd, uint64_t(j));
+            CrashWriteRaw(fd, "=");
+            CrashWriteHex(fd, context->uc_mcontext.regs[j]);
+        }
+        CrashWriteRaw(fd, "\n");
+    }
+
+    CrashWriteAddress(fd, "[crash]  fp=", context->uc_mcontext.regs[29]);
+    CrashWriteAddress(fd, " lr=", context->uc_mcontext.regs[30]);
+    CrashWriteRaw(fd, " sp=");
+    CrashWriteHex(fd, context->uc_mcontext.sp);
+    CrashWriteRaw(fd, "\n");
+#else
+    (void)context;
+#endif
+}
+
+// The thread name answers "which thread was this" without a tombstone: "main" is the
+// Android UI thread, the port's own threads have their own names. pthread_getname_np()
+// is not safe from a signal handler (bionic takes a lock to look the thread up), so read
+// /proc/self/comm directly - the handler runs on the faulting thread, so "self" is it.
+static void CrashWriteThreadName(int fd)
+{
+    const int commFd = open("/proc/self/comm", O_RDONLY | O_CLOEXEC);
+    if (commFd < 0)
+        return;
+
+    char name[32];
+    const ssize_t got = read(commFd, name, sizeof(name) - 1);
+    close(commFd);
+
+    if (got <= 0)
+        return;
+
+    name[got] = '\0';
+    for (ssize_t i = 0; i < got; i++)
+    {
+        if (name[i] == '\n')
+        {
+            name[i] = '\0';
+            break;
+        }
+    }
+
+    CrashWriteRaw(fd, " thread=");
+    CrashWriteRaw(fd, name);
 }
 
 static void CrashSignalHandler(int signal, siginfo_t* info, void* contextPtr)
@@ -395,6 +784,7 @@ static void CrashSignalHandler(int signal, siginfo_t* info, void* contextPtr)
         CrashWriteDec(fd, uint64_t(info != nullptr ? info->si_code : 0));
         CrashWriteRaw(fd, " tid=");
         CrashWriteDec(fd, uint64_t(GetTid()));
+        CrashWriteThreadName(fd);
         if (info != nullptr && (signal == SIGSEGV || signal == SIGBUS))
         {
             CrashWriteRaw(fd, " fault_addr=");
@@ -412,13 +802,20 @@ static void CrashSignalHandler(int signal, siginfo_t* info, void* contextPtr)
             CrashWriteRaw(fd, " sp=");
             CrashWriteHex(fd, context->uc_mcontext.sp);
             CrashWriteRaw(fd, "\n");
+
+            // pc is 0 when the fault was a call through a null pointer, so the caller is
+            // the first frame worth naming: walk the frame records for it.
+            CrashWriteFrameChain(fd, context);
+            CrashWriteRegisters(fd, context);
         }
 #endif
 
-        // Best-effort native unwind. The system tombstone remains authoritative,
-        // but this puts useful module+offset frames in log.txt without adb/root.
+        // Last resort: _Unwind_Backtrace() unwinds this handler's own stack, which the
+        // signal trampoline terminates after a frame or two, so it names the handler
+        // rather than the crash. It is kept because it still works on x86_64 (where the
+        // frame-record walk is compiled out) and when the frame pointer was clobbered.
         CrashUnwindState unwindState{ fd, 0 };
-        CrashWriteRaw(fd, "[crash] backtrace (best effort):\n");
+        CrashWriteRaw(fd, "[crash] handler unwind (frame 0 is this handler):\n");
         _Unwind_Backtrace(CrashUnwindCallback, &unwindState);
         CrashWriteRaw(fd, "[crash] end of report; the system tombstone (if any) has the full backtrace.\n");
     }
@@ -517,6 +914,7 @@ void os::logger::Init()
     WriteLogRecord("[build]", nullptr, BuildVersion, sizeof(BuildVersion) - 1);
     WriteLogRecord("[build]", nullptr, BuildId, sizeof(BuildId) - 1);
     LogDeviceInfo();
+    LoadCrashSymbols();
     InstallCrashHandler();
 }
 

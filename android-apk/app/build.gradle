@@ -81,6 +81,12 @@ android {
     packagingOptions {
         jniLibs {
             useLegacyPackaging true
+
+            // The on-device crash reporter symbolizes libmain.so addresses against the
+            // library's own symbol table (see os/android/logger_android.cpp), which is what
+            // makes tester crash reports actionable without adb or a tombstone. Debug
+            // variants are not stripped today; this keeps the table if that ever changes.
+            keepDebugSymbols.add("**/libmain.so")
         }
     }
     lint {
