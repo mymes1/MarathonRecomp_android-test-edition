@@ -53,6 +53,26 @@ static uint32_t g_clientCallbackParam{}; // pointer in guest memory
 static SDL_AudioDeviceID g_audioDevice{};
 static bool g_downMixToStereo;
 
+// The guest render callback is a function address that came out of guest memory when the
+// game registered its driver. A registration that resolves to nothing leaves the pointer
+// null, and invoking it was a jump to null on the audio thread (the same crash the
+// recompiled-code guard and GuestToHostFunction now report instead); name it once and keep
+// the clock thread alive.
+static bool InvokeClientCallback(PPCContext& ctx)
+{
+    if (g_clientCallback == nullptr)
+    {
+        static std::atomic<uint32_t> s_missingCallbackReports{ 0 };
+        if (s_missingCallbackReports.fetch_add(1, std::memory_order_relaxed) == 0)
+            LOG_ERROR("Audio: no guest render callback is registered; skipping the audio clock.");
+        return false;
+    }
+
+    ctx.r3.u32 = g_clientCallbackParam;
+    g_clientCallback(ctx, g_memory.base);
+    return true;
+}
+
 #if APU_PULL_MODEL
 
 // Device-side chunk. On Android small buffers select aggressive low-latency paths (MMAP)
@@ -519,8 +539,7 @@ static void AudioThread()
             }
 
             g_lastCallSubmitted = false;
-            ctx.ppcContext.r3.u32 = g_clientCallbackParam;
-            g_clientCallback(ctx.ppcContext, g_memory.base);
+            InvokeClientCallback(ctx.ppcContext);
             producedSlots++;
         }
 
@@ -747,8 +766,7 @@ static void AudioThread()
 
         if ((queuedAudioSize / callbackAudioSize) <= MAX_LATENCY)
         {
-            ctx.ppcContext.r3.u32 = g_clientCallbackParam;
-            g_clientCallback(ctx.ppcContext, g_memory.base);
+            InvokeClientCallback(ctx.ppcContext);
         }
 
         auto now = std::chrono::steady_clock::now();

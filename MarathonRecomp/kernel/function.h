@@ -325,7 +325,26 @@ T GuestToHostFunction(const TFunction& func, TArgs&&... argv)
     if constexpr (std::is_function_v<TFunction>)
         func(newCtx, g_memory.base);
     else
-        g_memory.FindFunction(func)(newCtx, g_memory.base);
+    {
+        // A guest address taken from memory (MARATHON_VIRTUAL_FUNCTION reads a vtable slot,
+        // some HLE paths take a callback field) is 0 or garbage whenever the object is
+        // half-constructed or was built on a guest null. Calling it directly faulted at
+        // pc=0 with nothing in the log - the same crash PPC_CALL_INDIRECT_FUNC already
+        // handles on the recompiled-code side - so report the address and skip the call,
+        // leaving a zero return value behind.
+        PPCFunc* pFunc = g_memory.FindFunctionChecked(uint32_t(func));
+
+        if (pFunc != nullptr)
+        {
+            pFunc(newCtx, g_memory.base);
+        }
+        else
+        {
+            newCtx.r3.u64 = 0;
+            newCtx.f1.f64 = 0.0;
+            PPCIndirectCallMissing(newCtx, g_memory.base, uint32_t(func));
+        }
+    }
 
     currentCtx.fpscr = newCtx.fpscr;
     SetPPCContext(currentCtx);

@@ -4,6 +4,7 @@
 
 #include "audio.h"
 #include <kernel/memory.h>
+#include <os/logger.h>
 
 #define AUDIO_DRIVER_KEY (uint32_t)('DAUD')
 
@@ -20,8 +21,19 @@ uint32_t XAudioRegisterRenderDriverClient(be<uint32_t>* callback, be<uint32_t>* 
     g_audioDumpStream.open(AUDIO_DUMP_SAMPLES_PATH, std::ios::binary);
 #endif
 
+    // The game passes a guest function address; it is not a recompiled function when the
+    // object was half-built or the recompiler skipped it. Registering null used to make the
+    // audio thread jump to null, so report it and let the driver's callback guard skip.
+    PPCFunc* pCallback = g_memory.FindFunctionChecked(uint32_t(*callback));
+
+    if (pCallback == nullptr)
+    {
+        LOGF_ERROR("Audio: render driver callback {:08X} is not a recompiled function; audio will stay silent.",
+            uint32_t(*callback));
+    }
+
     *driver = AUDIO_DRIVER_KEY;
-    XAudioRegisterClient(g_memory.FindFunction(*callback), callback[1]);
+    XAudioRegisterClient(pCallback, callback[1]);
     return 0;
 }
 
