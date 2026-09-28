@@ -608,7 +608,12 @@ struct UploadAllocator
         {
             buffer.buffer = g_device->createBuffer(RenderBufferDesc::UploadBuffer(UploadBuffer::SIZE, RenderBufferFlag::CONSTANT | RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX | RenderBufferFlag::DEVICE_ADDRESSABLE));
             buffer.memory = reinterpret_cast<uint8_t*>(buffer.buffer->map());
-            buffer.deviceAddress = buffer.buffer->getDeviceAddress();
+
+            // Device addresses are how this renderer hands its heaps to shaders, so without
+            // the feature there is no address to pass: CreateHostDevice has already warned
+            // that nothing will draw, and asking a device that does not provide the entry
+            // point for one would be worse than passing zero.
+            buffer.deviceAddress = g_device->getCapabilities().bufferDeviceAddress ? buffer.buffer->getDeviceAddress() : 0;
         }
         
         auto ref = buffer.buffer->at(offset);
@@ -2226,6 +2231,15 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 #endif
 
     g_capabilities = g_device->getCapabilities();
+
+    // The renderer hands its descriptor heaps to shaders as 64-bit device addresses in push
+    // constants, so a device without VK_KHR_buffer_device_address would draw with zero
+    // addresses and read nothing. Say it once, in the log a tester sends, instead of letting
+    // it look like a shader or texture problem.
+    if (!g_capabilities.bufferDeviceAddress)
+    {
+        LOG_WARNING("This GPU does not expose buffer device addresses (VK_KHR_buffer_device_address); push constant heap addresses will be zero and nothing will draw.");
+    }
 
 #if defined(__ANDROID__)
     // Testing hook: a force_no_bc.txt in the external driver_import folder (reachable over

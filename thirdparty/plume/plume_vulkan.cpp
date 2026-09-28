@@ -108,6 +108,65 @@ namespace plume {
 
     // Common functions.
 
+    // vkGetBufferDeviceAddress is a Vulkan 1.2 core entry point. volk resolves entry points
+    // by name through vkGetInstanceProcAddr when the instance is loaded, and on drivers that
+    // only implement Vulkan 1.1 (Mali reports 1.1.177 on the SM-X110) the loader leaves the
+    // core name null even though the instance itself was created as 1.2, while the
+    // VK_KHR_buffer_device_address alias does resolve. Calling the null core pointer was a
+    // jump to address zero inside VulkanBuffer::getDeviceAddress(), during the first upload
+    // buffer allocation. Prefer the core name when it resolved, then the alias, then a
+    // direct device lookup, and report once which one is in use.
+    static PFN_vkGetBufferDeviceAddress ResolveGetBufferDeviceAddress(VkDevice vk)
+    {
+        static VkDevice resolvedDevice = VK_NULL_HANDLE;
+        static PFN_vkGetBufferDeviceAddress resolvedEntryPoint = nullptr;
+
+        if (vk == resolvedDevice)
+            return resolvedEntryPoint;
+
+        PFN_vkGetBufferDeviceAddress entryPoint = vkGetBufferDeviceAddress;
+        const char *entryPointName = "vkGetBufferDeviceAddress";
+
+        if (entryPoint == nullptr)
+        {
+            entryPoint = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(vkGetBufferDeviceAddressKHR);
+            entryPointName = "vkGetBufferDeviceAddressKHR";
+        }
+
+        if (entryPoint == nullptr && vkGetDeviceProcAddr != nullptr && vk != VK_NULL_HANDLE)
+        {
+            entryPoint = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(vkGetDeviceProcAddr(vk, "vkGetBufferDeviceAddress"));
+            entryPointName = "vkGetBufferDeviceAddress";
+
+            if (entryPoint == nullptr)
+            {
+                entryPoint = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(vkGetDeviceProcAddr(vk, "vkGetBufferDeviceAddressKHR"));
+                entryPointName = "vkGetBufferDeviceAddressKHR";
+            }
+        }
+
+        resolvedDevice = vk;
+        resolvedEntryPoint = entryPoint;
+
+        if (entryPoint == nullptr)
+            fprintf(stderr, "No vkGetBufferDeviceAddress entry point available; buffer device addresses are unusable (is VK_KHR_buffer_device_address enabled?).\n");
+        else
+            fprintf(stderr, "Buffer device address entry point: %s.\n", entryPointName);
+
+        return entryPoint;
+    }
+
+    // Buffer device addresses are how the renderer passes its descriptor heaps to shaders
+    // (push constants), so a missing entry point must not be a call through null.
+    static VkDeviceAddress GetBufferDeviceAddressChecked(VkDevice vk, const VkBufferDeviceAddressInfo *info)
+    {
+        PFN_vkGetBufferDeviceAddress entryPoint = ResolveGetBufferDeviceAddress(vk);
+        if (entryPoint == nullptr)
+            return 0;
+
+        return entryPoint(vk, info);
+    }
+
     static uint32_t roundUp(uint32_t value, uint32_t powerOf2Alignment) {
         return (value + powerOf2Alignment - 1) & ~(powerOf2Alignment - 1);
     }
@@ -957,7 +1016,7 @@ namespace plume {
         info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
         info.pNext = nullptr;
         info.buffer = vk;
-        return vkGetBufferDeviceAddress(device->vk, &info);
+        return GetBufferDeviceAddressChecked(device->vk, &info);
     }
 
     // VulkanBufferFormattedView
@@ -2986,7 +3045,7 @@ namespace plume {
         tableAddressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
         tableAddressInfo.buffer = interfaceBuffer->vk;
 
-        const VkDeviceAddress tableAddress = vkGetBufferDeviceAddress(queue->device->vk, &tableAddressInfo) + shaderBindingTable.offset;
+        const VkDeviceAddress tableAddress = GetBufferDeviceAddressChecked(queue->device->vk, &tableAddressInfo) + shaderBindingTable.offset;
         const RenderShaderBindingGroupInfo &rayGen = shaderBindingGroupsInfo.rayGen;
         const RenderShaderBindingGroupInfo &miss = shaderBindingGroupsInfo.miss;
         const RenderShaderBindingGroupInfo &hitGroup = shaderBindingGroupsInfo.hitGroup;
@@ -3470,7 +3529,7 @@ namespace plume {
         buildGeometryInfo.flags = toRTASBuildFlags(buildInfo.preferFastBuild, buildInfo.preferFastTrace);
         buildGeometryInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         buildGeometryInfo.dstAccelerationStructure = interfaceAccelerationStructure->vk;
-        buildGeometryInfo.scratchData.deviceAddress = vkGetBufferDeviceAddress(queue->device->vk, &scratchAddressInfo) + scratchBuffer.offset;
+        buildGeometryInfo.scratchData.deviceAddress = GetBufferDeviceAddressChecked(queue->device->vk, &scratchAddressInfo) + scratchBuffer.offset;
         buildGeometryInfo.pGeometries = reinterpret_cast<const VkAccelerationStructureGeometryKHR *>(buildInfo.buildData.data());
         buildGeometryInfo.geometryCount = buildInfo.meshCount;
 
@@ -3512,14 +3571,14 @@ namespace plume {
 
         VkAccelerationStructureGeometryInstancesDataKHR &instancesData = topGeometry.geometry.instances;
         instancesData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-        instancesData.data.deviceAddress = vkGetBufferDeviceAddress(queue->device->vk, &instancesAddressInfo) + instancesBuffer.offset;
+        instancesData.data.deviceAddress = GetBufferDeviceAddressChecked(queue->device->vk, &instancesAddressInfo) + instancesBuffer.offset;
 
         VkAccelerationStructureBuildGeometryInfoKHR buildGeometryInfo = {};
         buildGeometryInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
         buildGeometryInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
         buildGeometryInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         buildGeometryInfo.dstAccelerationStructure = interfaceAccelerationStructure->vk;
-        buildGeometryInfo.scratchData.deviceAddress = vkGetBufferDeviceAddress(queue->device->vk, &scratchAddressInfo) + scratchBuffer.offset;
+        buildGeometryInfo.scratchData.deviceAddress = GetBufferDeviceAddressChecked(queue->device->vk, &scratchAddressInfo) + scratchBuffer.offset;
         buildGeometryInfo.pGeometries = &topGeometry;
         buildGeometryInfo.geometryCount = 1;
 
@@ -4397,7 +4456,7 @@ namespace plume {
                 VkBufferDeviceAddressInfo vertexAddressInfo = {};
                 vertexAddressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
                 vertexAddressInfo.buffer = interfaceVertexBuffer->vk;
-                triangles.vertexData.deviceAddress = vkGetBufferDeviceAddress(vk, &vertexAddressInfo) + mesh.vertexBuffer.offset;
+                triangles.vertexData.deviceAddress = GetBufferDeviceAddressChecked(vk, &vertexAddressInfo) + mesh.vertexBuffer.offset;
             }
 
             if (interfaceIndexBuffer != nullptr) {
@@ -4406,7 +4465,7 @@ namespace plume {
                 VkBufferDeviceAddressInfo indexAddressInfo = {};
                 indexAddressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
                 indexAddressInfo.buffer = interfaceIndexBuffer->vk;
-                triangles.indexData.deviceAddress = vkGetBufferDeviceAddress(vk, &indexAddressInfo) + mesh.indexBuffer.offset;
+                triangles.indexData.deviceAddress = GetBufferDeviceAddressChecked(vk, &indexAddressInfo) + mesh.indexBuffer.offset;
                 geometryPrimitiveCounts[i] = mesh.indexCount / 3;
             }
             else {
@@ -4459,7 +4518,7 @@ namespace plume {
             VkBufferDeviceAddressInfo blasAddressInfo = {};
             blasAddressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
             blasAddressInfo.buffer = interfaceBottomLevelAS->vk;
-            bufferInstance.accelerationStructureReference = vkGetBufferDeviceAddress(vk, &blasAddressInfo) + instance.bottomLevelAS.offset;
+            bufferInstance.accelerationStructureReference = GetBufferDeviceAddressChecked(vk, &blasAddressInfo) + instance.bottomLevelAS.offset;
         }
 
         // Retrieve the size the TLAS will require.
