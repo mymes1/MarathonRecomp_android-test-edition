@@ -622,6 +622,32 @@ struct UploadAllocator
         return { ref.ref, ref.offset, buffer.memory + ref.offset, buffer.deviceAddress + ref.offset };
     }
 
+    // Makes this frame's writes visible to the GPU. The buffers stay mapped for their lifetime
+    // (only the first allocation maps them), so nothing unmaps them and nothing would flush the
+    // mapped writes: without this the GPU reads whatever the pages held before, which on a
+    // device whose upload memory is HOST_VISIBLE but not HOST_COHERENT means vertex streams,
+    // index buffers and shader constants arrive as garbage. Called once per frame, after all
+    // recording is done and before the command list that reads this data is submitted. On
+    // coherent memory the flush is skipped internally, so this costs nothing where it is not
+    // needed.
+    void flush()
+    {
+        for (uint32_t i = 0; i < buffers.size() && i <= index; i++)
+        {
+            auto& buffer = buffers[i];
+
+            if (buffer.buffer == nullptr)
+                continue;
+
+            // Buffers before the current one were filled to the end; the current one up to
+            // the write cursor.
+            const uint64_t usedSize = (i < index) ? UploadBuffer::SIZE : offset;
+
+            if (usedSize != 0)
+                buffer.buffer->flushRange(0, usedSize);
+        }
+    }
+
     template<bool TByteSwap, typename T>
     UploadAllocation allocate(const T* memory, uint32_t size, uint32_t alignment)
     {
@@ -3815,6 +3841,12 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
     auto &commandList = g_commandLists[g_frame];
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 1);
     commandList->end();
+
+    // Every host write this frame made landed in the upload ring through a pointer that stays
+    // mapped, so nothing has flushed them yet. This is the last point before the GPU starts
+    // reading: flush the written ranges, or on non-coherent upload memory the vertices,
+    // indices and constants the shaders fetch are whatever the pages happened to contain.
+    g_uploadAllocators[g_frame].flush();
 
     if (g_swapChainValid)
     {

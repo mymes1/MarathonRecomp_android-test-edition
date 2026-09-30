@@ -1015,6 +1015,33 @@ namespace plume {
             fprintf(stderr, "vmaCreateBuffer failed with error code 0x%X.\n", res);
             return;
         }
+
+        // Report once which memory the driver put an upload buffer in, and whether the CPU and
+        // the GPU see the same bytes without a flush. On a HOST_VISIBLE but not HOST_COHERENT
+        // type every write through map()/flushRange() needs an explicit flush, and a caller
+        // that forgets one gets geometry, constants or textures that never reach the GPU -
+        // which looks like corruption rather than a sync problem, so the answer is worth
+        // having in the log.
+        static bool s_loggedUploadMemoryType = false;
+        if (!s_loggedUploadMemoryType && desc.heapType == RenderHeapType::UPLOAD) {
+            const VkPhysicalDeviceMemoryProperties *memoryProperties = nullptr;
+            vmaGetMemoryProperties(device->allocator, &memoryProperties);
+
+            if (memoryProperties != nullptr && allocationInfo.memoryType < memoryProperties->memoryTypeCount) {
+                s_loggedUploadMemoryType = true;
+
+                const VkMemoryPropertyFlags flags = memoryProperties->memoryTypes[allocationInfo.memoryType].propertyFlags;
+                fprintf(stderr, "Upload buffer memory: type %u of %u, %s%s%s%s%s%s, nonCoherentAtomSize %llu.\n",
+                    allocationInfo.memoryType, memoryProperties->memoryTypeCount,
+                    (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "DEVICE_LOCAL " : "",
+                    (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "HOST_VISIBLE " : "",
+                    (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? "HOST_COHERENT" : "not-HOST_COHERENT",
+                    (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? " HOST_CACHED" : "",
+                    (flags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) ? " LAZILY_ALLOCATED" : "",
+                    (flags & VK_MEMORY_PROPERTY_PROTECTED_BIT) ? " PROTECTED" : "",
+                    (unsigned long long)device->physicalDeviceProperties.limits.nonCoherentAtomSize);
+            }
+        }
     }
 
     VulkanBuffer::~VulkanBuffer() {
@@ -1031,11 +1058,40 @@ namespace plume {
             return nullptr;
         }
 
+        // Reading what the GPU wrote needs an invalidate first on non-coherent memory.
+        if (readRange != nullptr && readRange->end > readRange->begin) {
+            vmaInvalidateAllocation(device->allocator, allocation, readRange->begin, readRange->end - readRange->begin);
+        }
+
         return data;
     }
 
     void VulkanBuffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
+        // Flush before unmapping, because vmaUnmapMemory() does not: its documentation says
+        // "This function doesn't automatically flush or invalidate caches. If the allocation is
+        // made from a memory types that is not HOST_COHERENT, you also need to use
+        // vmaInvalidateAllocation() / vmaFlushAllocation()". Upload memory is HOST_VISIBLE but
+        // often not HOST_COHERENT on mobile GPUs, so without this the GPU reads whatever was in
+        // those pages before (or nothing at all). The written range is what the API has always
+        // meant to pass on; without one, the whole allocation is the safe interpretation.
+        if (writtenRange != nullptr && writtenRange->end > writtenRange->begin) {
+            vmaFlushAllocation(device->allocator, allocation, writtenRange->begin, writtenRange->end - writtenRange->begin);
+        }
+        else {
+            vmaFlushAllocation(device->allocator, allocation, 0, VK_WHOLE_SIZE);
+        }
+
         vmaUnmapMemory(device->allocator, allocation);
+    }
+
+    void VulkanBuffer::flushRange(uint64_t offset, uint64_t size) {
+        if (size == 0) {
+            return;
+        }
+
+        // Ignored by VMA for memory that is HOST_COHERENT or not HOST_VISIBLE, and the range is
+        // rounded out to nonCoherentAtomSize internally.
+        vmaFlushAllocation(device->allocator, allocation, offset, size);
     }
 
     std::unique_ptr<RenderBufferFormattedView> VulkanBuffer::createBufferFormattedView(RenderFormat format) {

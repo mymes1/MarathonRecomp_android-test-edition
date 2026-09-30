@@ -62,6 +62,7 @@ namespace plume {
         ~VulkanBuffer() override;
         void *map(uint32_t subresource, const RenderRange *readRange) override;
         void unmap(uint32_t subresource, const RenderRange *writtenRange) override;
+        void flushRange(uint64_t offset, uint64_t size) override;
         std::unique_ptr<RenderBufferFormattedView> createBufferFormattedView(RenderFormat format) override;
         void setName(const std::string &name) override;
         uint64_t getDeviceAddress() const override;

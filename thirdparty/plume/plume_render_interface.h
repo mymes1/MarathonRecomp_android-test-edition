@@ -22,6 +22,16 @@ namespace plume {
         virtual ~RenderBuffer() { }
         virtual void *map(uint32_t subresource = 0, const RenderRange *readRange = nullptr) = 0;
         virtual void unmap(uint32_t subresource = 0, const RenderRange *writtenRange = nullptr) = 0;
+
+        // Makes host writes that landed in the mapped range [offset, offset + size) visible to
+        // the GPU. Backends whose upload memory is host-coherent (D3D12 upload heaps, Metal on
+        // shared storage) get this for free and can leave the default no-op; Vulkan upload
+        // memory is frequently HOST_VISIBLE but not HOST_COHERENT, where the specification
+        // requires an explicit flush. A persistently mapped buffer that is rewritten every
+        // frame - the game's upload ring - has to call this once the writes are done and
+        // before the commands reading them are submitted. Flushing a range that needs no
+        // flush is harmless: implementations skip coherent memory.
+        virtual void flushRange(uint64_t offset, uint64_t size) { }
         virtual std::unique_ptr<RenderBufferFormattedView> createBufferFormattedView(RenderFormat format) = 0;
         virtual void setName(const std::string &name) = 0;
         virtual uint64_t getDeviceAddress() const = 0;
