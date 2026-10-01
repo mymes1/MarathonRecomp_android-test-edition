@@ -945,7 +945,18 @@ namespace plume {
         VkBufferCreateInfo bufferInfo = {};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bufferInfo.size = desc.size;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        // See VulkanDevice::concurrentSharing: an upload is copied into this buffer on the
+        // copy queue and read on the graphics queue, so the two families have to be allowed
+        // to access it when they are not the same family.
+        if (device->concurrentSharing) {
+            bufferInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            bufferInfo.queueFamilyIndexCount = 2;
+            bufferInfo.pQueueFamilyIndices = device->concurrentQueueFamilyIndices;
+        }
+        else {
+            bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        }
         bufferInfo.usage |= (desc.flags & RenderBufferFlag::VERTEX) ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : 0;
         bufferInfo.usage |= (desc.flags & RenderBufferFlag::INDEX) ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT : 0;
         bufferInfo.usage |= (desc.flags & RenderBufferFlag::STORAGE) ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0;
@@ -1161,7 +1172,17 @@ namespace plume {
         imageInfo.samples = VkSampleCountFlagBits(desc.multisampling.sampleCount);
         imageInfo.tiling = toVk(desc.textureArrangement);
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        // Same cross family hand off as VulkanBuffer: textures are uploaded on the copy
+        // queue and sampled (or rendered into) on the graphics queue.
+        if (device->concurrentSharing) {
+            imageInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            imageInfo.queueFamilyIndexCount = 2;
+            imageInfo.pQueueFamilyIndices = device->concurrentQueueFamilyIndices;
+        }
+        else {
+            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        }
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         imageInfo.usage |= (desc.flags & RenderTextureFlag::RENDER_TARGET) ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0;
         imageInfo.usage |= (desc.flags & RenderTextureFlag::DEPTH_TARGET) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
@@ -4288,19 +4309,25 @@ namespace plume {
         pickFamilyQueue(RenderCommandListType::COPY, VK_QUEUE_TRANSFER_BIT);
 
         // The copy work this renderer does on the transfer queue (buffer and texture uploads)
-        // writes resources that the graphics queue later reads. Resources are created with
-        // VK_SHARING_MODE_EXCLUSIVE and nothing transfers queue family ownership, so when the
-        // two queues belong to different families every such hand off is undefined
-        // behaviour - the GPU may read whatever the copy left in flight. Desktop drivers
-        // tend to hide it, tile based mobile drivers often do not, so the relation is worth
-        // having in the log.
+        // writes resources that the graphics queue later reads. Nothing transfers queue
+        // family ownership, so when the two queues belong to different families the hand off
+        // is only valid if the resources are created to be shared between both families.
+        // Desktop drivers tend to hide the difference, tile based mobile drivers often do
+        // not, so the relation is worth having in the log.
+        const uint32_t directFamilyIndex = queueFamilyIndices[toFamilyIndex(RenderCommandListType::DIRECT)];
+        const uint32_t copyFamilyIndex = queueFamilyIndices[toFamilyIndex(RenderCommandListType::COPY)];
+
+        concurrentSharing = directFamilyIndex != copyFamilyIndex;
+        concurrentQueueFamilyIndices[0] = directFamilyIndex;
+        concurrentQueueFamilyIndices[1] = copyFamilyIndex;
+
         fprintf(stderr, "Queue families: direct %u, compute %u, copy %u%s.\n",
-            queueFamilyIndices[toFamilyIndex(RenderCommandListType::DIRECT)],
+            directFamilyIndex,
             queueFamilyIndices[toFamilyIndex(RenderCommandListType::COMPUTE)],
-            queueFamilyIndices[toFamilyIndex(RenderCommandListType::COPY)],
-            queueFamilyIndices[toFamilyIndex(RenderCommandListType::DIRECT)] == queueFamilyIndices[toFamilyIndex(RenderCommandListType::COPY)]
-                ? " (one family: uploads and rendering are ordered)"
-                : " (copy family differs: uploads and rendering cross a family boundary)");
+            copyFamilyIndex,
+            concurrentSharing
+                ? " (copy family differs: uploads are shared with the graphics queue)"
+                : " (one family: uploads and rendering are ordered)");
 
         // Create the struct to store the virtual queues.
         queueFamilies.resize(queueFamilyCount);

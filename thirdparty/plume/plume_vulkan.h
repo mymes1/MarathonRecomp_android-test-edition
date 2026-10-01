@@ -411,6 +411,14 @@ namespace plume {
         VkPhysicalDeviceProperties physicalDeviceProperties = {};
         VmaAllocator allocator = VK_NULL_HANDLE;
         uint32_t queueFamilyIndices[3] = {};
+
+        // Set when the copy queue used for uploads ends up in a different queue family than
+        // the graphics queue. Nothing in this renderer performs a queue family ownership
+        // transfer, so resources that are written by a copy and then read by rendering have
+        // to be shared between the two families instead of exclusively owned by one of them.
+        bool concurrentSharing = false;
+        uint32_t concurrentQueueFamilyIndices[2] = {};
+
         std::vector<VulkanQueueFamily> queueFamilies;
         RenderDeviceCapabilities capabilities;
         RenderDeviceDescription description;
