@@ -457,6 +457,16 @@ static std::unique_ptr<RenderDescriptorSet> g_conditionalSurveyDescriptorSet;
 // without rebuilding the APK.
 static bool g_forceDisableConditionalSurvey = false;
 
+// Diagnostic override (Android): when a driver_import/dump_draw_state.txt marker exists,
+// the port verifies the data it hands the GPU instead of trusting it. Every buffer upload
+// is compared against what the GPU buffer actually holds (they are only expected to differ
+// on a device whose buffers are not host visible, where the check is skipped), and the
+// first draws of each frame log the render state they were recorded with. This exists
+// because the remaining corruption candidates - vertex data that never arrives, wrong
+// strides, wrong constants - are indistinguishable from a screenshot but separate cleanly
+// in a log.
+static bool g_dumpDrawState = false;
+
 enum
 {
     TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D,
@@ -2328,6 +2338,16 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
             LOG_WARNING("disable_conditional_survey.txt present: occlusion survey disabled (every draw renders unconditionally).");
         }
     }
+
+    {
+        std::error_code dumpStateEc;
+        if (std::filesystem::exists(os::android::GetExternalFilesDir() / "driver_import" / "dump_draw_state.txt", dumpStateEc) ||
+            std::filesystem::exists(os::android::GetInternalFilesDir() / "dump_draw_state.txt", dumpStateEc))
+        {
+            g_dumpDrawState = true;
+            LOG_WARNING("dump_draw_state.txt present: upload integrity and draw state will be logged.");
+        }
+    }
 #endif
 
     if (!g_capabilities.textureCompressionBC)
@@ -2974,6 +2994,63 @@ static void* LockVertexBuffer(GuestBuffer* buffer, uint32_t, uint32_t, uint32_t 
 
 static std::atomic<uint32_t> g_bufferUploadCount = 0;
 
+// Diagnostic (see g_dumpDrawState): checks that what the guest wrote into a buffer really
+// ended up in the GPU buffer. The upload copies through a staging buffer and byte swaps on
+// the way, so the comparison undoes the swap the same way the copy applied it. Only
+// meaningful once the copy has completed - the path that uses the copy queue waits on its
+// fence - and only possible where the destination is host visible, which is checked by the
+// map below failing. A mismatch is the whole answer: it means the corruption starts before
+// the shader ever runs.
+template<typename T>
+static void CheckBufferUpload(GuestBuffer* buffer)
+{
+    static uint32_t s_checkedUploads = 0;
+    static bool s_unavailable = false;
+
+    if (!g_dumpDrawState || s_unavailable || s_checkedUploads >= 64)
+        return;
+
+    void *mapped = buffer->buffer->map();
+
+    if (mapped == nullptr)
+    {
+        // Device buffers are not host visible here; nothing can be compared. Say so once
+        // instead of failing quietly on every upload.
+        s_unavailable = true;
+        LOG_WARNING("Buffer upload check unavailable: this device's buffers are not host visible.");
+        return;
+    }
+
+    const T *src = reinterpret_cast<const T*>(buffer->mappedMemory);
+    const T *dst = reinterpret_cast<const T*>(mapped);
+    const size_t count = buffer->dataSize / sizeof(T);
+
+    size_t mismatches = 0;
+    size_t firstMismatch = 0;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        if (ByteSwap(dst[i]) != src[i])
+        {
+            if (mismatches == 0)
+                firstMismatch = i;
+
+            mismatches++;
+        }
+    }
+
+    buffer->buffer->unmap();
+
+    // Always log the first few, and afterwards only the failures, so a clean run stays short.
+    if (mismatches != 0 || s_checkedUploads < 8)
+    {
+        LOGF("Buffer upload check #{}{}: {} of {} {}-byte words differ (first at word {}), {} bytes total.",
+            s_checkedUploads, mismatches == 0 ? "" : " FAILED", mismatches, count, sizeof(T), firstMismatch, buffer->dataSize);
+    }
+
+    s_checkedUploads++;
+}
+
 template<typename T>
 static void UnlockBuffer(GuestBuffer* buffer, bool useCopyQueue)
 {
@@ -3006,6 +3083,10 @@ static void UnlockBuffer(GuestBuffer* buffer, bool useCopyQueue)
                 {
                     g_copyCommandList->copyBufferRegion(buffer->buffer->at(0), uploadBuffer->at(0), buffer->dataSize);
                 });
+
+            // The copy has completed (the helper above waits on its fence), so the
+            // destination can be inspected before anything reads it.
+            CheckBufferUpload<T>(buffer);
         }
         else
         {
@@ -5712,6 +5793,25 @@ static void DrawPrimitive(GuestDevice* device, uint32_t primitiveType, uint32_t 
     queue.submit();
 }
 
+// Diagnostic (see g_dumpDrawState): records the state a draw was recorded with. Bands,
+// wedges and fans look alike from a screenshot but differ in this data: a wrong stride or
+// index format shows up here, a collapsed transform does not.
+static void DumpDrawState(const char *kind, uint32_t primitiveCount)
+{
+    static uint32_t s_loggedDraws = 0;
+
+    if (!g_dumpDrawState || s_loggedDraws >= 60)
+        return;
+
+    LOGF("Draw #{} ({}): primitives={}, strides={},{},{}, indexFormat={}, indexBuffer={}.",
+        s_loggedDraws, kind, primitiveCount,
+        g_pipelineState.vertexStrides[0], g_pipelineState.vertexStrides[1], g_pipelineState.vertexStrides[2],
+        uint32_t(g_indexBufferView.format),
+        g_indexBufferView.buffer.ref != nullptr ? "bound" : "none");
+
+    s_loggedDraws++;
+}
+
 static void ProcDrawPrimitive(const RenderCommand& cmd)
 {
     const auto& args = cmd.drawPrimitive;
@@ -5719,6 +5819,7 @@ static void ProcDrawPrimitive(const RenderCommand& cmd)
     SetPrimitiveType(args.primitiveType);
 
     FlushRenderStateForRenderThread();
+    DumpDrawState("primitive", args.primitiveCount);
 
     auto& commandList = g_commandLists[g_frame];
     commandList->drawInstanced(args.primitiveCount, 1, args.startVertex, 0);
@@ -5745,6 +5846,7 @@ static void ProcDrawIndexedPrimitive(const RenderCommand& cmd)
 
     SetPrimitiveType(args.primitiveType);
     FlushRenderStateForRenderThread();
+    DumpDrawState("indexed", args.primCount);
 
     g_commandLists[g_frame]->drawIndexedInstanced(args.primCount, 1, args.startIndex, args.baseVertexIndex, 0);
 }
@@ -5771,6 +5873,7 @@ static void ProcDrawPrimitiveUP(const RenderCommand& cmd)
     const auto& args = cmd.drawPrimitiveUP;
 
     SetPrimitiveType(args.primitiveType);
+    DumpDrawState("primitiveUP", args.primitiveCount);
     SetDirtyValue(g_dirtyStates.pipelineState, g_pipelineState.vertexStrides[0], uint8_t(args.vertexStreamZeroStride));
 
     auto allocation = g_uploadAllocators[g_frame].allocate<true>(reinterpret_cast<const uint32_t*>(args.vertexStreamZeroData), args.vertexStreamZeroSize, 0x4);

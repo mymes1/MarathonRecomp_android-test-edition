@@ -4287,6 +4287,21 @@ namespace plume {
         pickFamilyQueue(RenderCommandListType::COMPUTE, VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
         pickFamilyQueue(RenderCommandListType::COPY, VK_QUEUE_TRANSFER_BIT);
 
+        // The copy work this renderer does on the transfer queue (buffer and texture uploads)
+        // writes resources that the graphics queue later reads. Resources are created with
+        // VK_SHARING_MODE_EXCLUSIVE and nothing transfers queue family ownership, so when the
+        // two queues belong to different families every such hand off is undefined
+        // behaviour - the GPU may read whatever the copy left in flight. Desktop drivers
+        // tend to hide it, tile based mobile drivers often do not, so the relation is worth
+        // having in the log.
+        fprintf(stderr, "Queue families: direct %u, compute %u, copy %u%s.\n",
+            queueFamilyIndices[toFamilyIndex(RenderCommandListType::DIRECT)],
+            queueFamilyIndices[toFamilyIndex(RenderCommandListType::COMPUTE)],
+            queueFamilyIndices[toFamilyIndex(RenderCommandListType::COPY)],
+            queueFamilyIndices[toFamilyIndex(RenderCommandListType::DIRECT)] == queueFamilyIndices[toFamilyIndex(RenderCommandListType::COPY)]
+                ? " (one family: uploads and rendering are ordered)"
+                : " (copy family differs: uploads and rendering cross a family boundary)");
+
         // Create the struct to store the virtual queues.
         queueFamilies.resize(queueFamilyCount);
 
